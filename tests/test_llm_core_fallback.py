@@ -501,6 +501,9 @@ def test_candidate_request_factory_ineligible_failure_stops_streaming_route(monk
 def test_response_cache_is_partitioned_by_non_secret_header_identity(monkeypatch):
     calls = []
     llm_core._response_cache.clear()
+    # The cache is opt-in now (default OFF — stale-response guard); tests that
+    # exercise cache behavior must enable it explicitly.
+    monkeypatch.setattr(llm_core, "_response_cache_enabled", lambda: True)
 
     def fake_post(url, headers=None, json=None, timeout=None):
         credential = headers.get("Authorization")
@@ -786,6 +789,8 @@ def test_nonstream_model_metadata_round_trips_through_response_cache(monkeypatch
     calls = []
     llm_core._response_cache.clear()
     llm_core._response_model_cache.clear()
+    # The cache is opt-in now (default OFF — stale-response guard).
+    monkeypatch.setattr(llm_core, "_response_cache_enabled", lambda: True)
 
     class _Response:
         is_success = True

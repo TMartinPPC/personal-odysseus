@@ -807,6 +807,35 @@ async def _document_tool_dispatch(
 # Dispatcher
 # ---------------------------------------------------------------------------
 
+def _suggest_tool_names(tool: str, max_suggestions: int = 3) -> list:
+    """Suggest known tool names close to an unknown one.
+
+    Models occasionally mis-transcribe long tool names (e.g. 'websearch' for
+    'web_search', 'list_sessions' for 'list_sessions_tool'). A fuzzy match on
+    the whole name plus the trailing verb segment ('search', 'sessions')
+    turns a dead-end error into a self-correcting one (oh-my-pi pattern).
+    """
+    from difflib import get_close_matches
+    from src.agent_tools import TOOL_TAGS
+    from src.tool_parsing import _TOOL_NAME_MAP
+
+    known = sorted(set(TOOL_TAGS) | set(_TOOL_NAME_MAP.values()))
+    t = (tool or "").strip().lower()
+    if not t:
+        return []
+    suggestions = get_close_matches(t, known, n=max_suggestions, cutoff=0.6)
+    if suggestions:
+        return suggestions
+    # Trailing-verb segment match: models reliably keep the final verb
+    # ('websearch' -> 'search', 'run_command' -> trailing 'command').
+    parts = [p for p in re.split(r"[_\-\s]+", t) if len(p) >= 3]
+    for part in reversed(parts):
+        matches = [k for k in known if part in k and k not in suggestions]
+        if matches:
+            return matches[:max_suggestions]
+    return []
+
+
 async def execute_tool_block(
     block: Any,
     session_id: Optional[str] = None,
@@ -1334,8 +1363,9 @@ async def _execute_tool_block_impl(
 
     else:
         desc = f"unknown: {tool}"
+        _hint = _suggest_tool_names(tool)
         result = {
-            "error": f"Unknown tool: {tool}",
+            "error": f"Unknown tool: {tool}" + (f". Did you mean: {', '.join(_hint)}?" if _hint else ". Use one of the tools listed in this turn's tool schemas."),
             "exit_code": 1
         }
 

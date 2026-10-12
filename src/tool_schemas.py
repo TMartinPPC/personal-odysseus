@@ -8,8 +8,10 @@ Extracted from agent_tools.py to keep schema definitions separate from
 tool parsing / execution logic.
 """
 
+import ast
 import json
 import logging
+import re
 from typing import Optional
 
 from src.agent_tools import ToolBlock, TOOL_TAGS
@@ -94,7 +96,7 @@ FUNCTION_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read a file from disk. Optionally read a line range with offset/limit for large files.",
+            "description": "Read a file from disk. Returns line-numbered output ('N: line') with a header showing the line range. Output is capped; when truncated, re-call with offset/limit using the exact 'Continue reading with offset: N' value from the footer. When editing, strip the 'N: ' prefix from lines you copy into old_string.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -180,7 +182,7 @@ FUNCTION_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "edit_file",
-            "description": "Edit a file ON DISK by exact string replacement (home folder, project files, any real path like ~/sweden.txt or /path/to/file). This is the right tool for files on disk — NOT edit_document (that's for editor-panel documents). PREFER this over bash (sed/echo) — it shows a diff. old_string must match the file exactly and be unique (or set replace_all). Use write_file to create a new file.",
+            "description": "Edit a file ON DISK by exact string replacement (home folder, project files, any real path like ~/sweden.txt or /path/to/file). This is the right tool for files on disk — NOT edit_document (that's for editor-panel documents). PREFER this over bash (sed/echo) — it shows a diff. old_string must match the file exactly and be unique (or set replace_all). Use write_file to create a new file. If you copy lines from read_file output, strip the 'N: ' line-number prefix and preserve exact indentation.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1335,6 +1337,70 @@ def _decode_loose_json_string(value: str) -> str:
     return "".join(out)
 
 
+def _repair_function_arguments(arguments: str) -> Optional[dict]:
+    """Best-effort repair of common malformed native-call argument JSON.
+
+    Small/local models routinely emit arguments that are *semantically* fine
+    but not strict JSON: markdown-fenced, single-quoted (Python dict style),
+    trailing commas, or unquoted keys. These previously made the whole call
+    get dropped ("Failed to parse function call arguments"), which the user
+    sees as the model ignoring them. Repair tiers, cheapest first:
+      1. strip ```json / ``` fences and surrounding prose
+      2. ast.literal_eval (handles single quotes, True/False/None)
+      3. JSON5-ish salvage: trailing commas, then smart-quote normalization
+    Returns a dict on success, None when nothing applies.
+    """
+    if not isinstance(arguments, str):
+        return None
+    s = arguments.strip()
+    if not s:
+        return None
+
+    # Tier 1: strip markdown fences and any leading/trailing prose lines.
+    fence = re.match(r"^```[a-zA-Z0-9_]*\s*\n?([\s\S]*?)\n?```\s*$", s)
+    if fence:
+        s = fence.group(1).strip()
+    elif not s.startswith("{"):
+        first = s.find("{")
+        last = s.rfind("}")
+        if first != -1 and last > first:
+            candidate = s[first:last + 1]
+            try:
+                parsed = json.loads(candidate)
+                return parsed if isinstance(parsed, dict) else None
+            except (json.JSONDecodeError, ValueError):
+                s = candidate
+
+    # Tier 2: Python-literal parsing (single quotes, True/False/None).
+    try:
+        parsed = ast.literal_eval(s)
+        if isinstance(parsed, dict):
+            return parsed
+    except (ValueError, SyntaxError, MemoryError, RecursionError):
+        pass
+
+    # Tier 3a: remove trailing commas before } or ].
+    salvaged = re.sub(r",\s*([}\]])", r"\1", s)
+    if salvaged != s:
+        try:
+            parsed = json.loads(salvaged)
+            if isinstance(parsed, dict):
+                return parsed
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    # Tier 3b: normalize smart quotes and retry the literal_eval path.
+    resmarted = s.replace("\u201c", '"').replace("\u201d", '"').replace("\u2018", "'").replace("\u2019", "'")
+    if resmarted != s:
+        try:
+            parsed = ast.literal_eval(resmarted)
+            if isinstance(parsed, dict):
+                return parsed
+        except (ValueError, SyntaxError, MemoryError, RecursionError):
+            pass
+    return None
+
+
 def _repair_document_function_args(tool_type: str, arguments: str) -> Optional[dict]:
     """Salvage obvious malformed document tool args from local model wrappers.
 
@@ -1380,8 +1446,12 @@ def function_call_to_tool_block(name: str, arguments: str) -> Optional[ToolBlock
         if args is not None:
             logger.warning(f"Repaired malformed document function call arguments for {name}")
         else:
-            logger.error(f"Failed to parse function call arguments for {name}: {arguments}")
-            return None
+            args = _repair_function_arguments(arguments)
+            if args is not None:
+                logger.warning(f"Repaired malformed function call arguments for {name}")
+            else:
+                logger.error(f"Failed to parse function call arguments for {name}: {arguments}")
+                return None
 
     # Some models emit valid JSON that isn't an object (e.g. a bare array
     # ["ls -la"], string, or number) as function arguments. Most local tools keep
@@ -1409,7 +1479,12 @@ def function_call_to_tool_block(name: str, arguments: str) -> Optional[ToolBlock
     if name in BUILTIN_EMAIL_TOOLS:
         return ToolBlock(f"mcp__email__{name}", json.dumps(args) if args else "{}")
     if tool_type not in TOOL_TAGS:
-        logger.warning(f"Unknown function call: {name}")
+        from src.tool_execution import _suggest_tool_names
+        _hint = _suggest_tool_names(name)
+        logger.warning(
+            f"Unknown function call: {name}"
+            + (f" (did you mean: {', '.join(_hint)}?)" if _hint else "")
+        )
         return None
 
     # Convert structured args back to the text format each tool expects

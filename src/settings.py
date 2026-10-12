@@ -113,7 +113,7 @@ DEFAULT_SETTINGS = {
     # Tune via Settings or by editing data/settings.json.
     "research_run_timeout_seconds": 1800,
     "agent_max_tool_calls": 0,
-    "agent_max_rounds": 20,  # per-message agent step cap (clamped 1..200)
+    "agent_max_rounds": 50,  # per-message agent step cap (clamped 1..200); matches MAX_AGENT_ROUNDS
     # Soft input-token budget for the agent loop. The DEFAULT value (6000) is the
     # "auto" sentinel: it means "scale the budget to the model's context window"
     # (#1230) — so long-context models aren't capped at 6000. Set ANY OTHER value
@@ -132,6 +132,10 @@ DEFAULT_SETTINGS = {
     # `compute_input_token_budget`.
     "agent_input_token_hard_max": 200_000,
     "agent_stream_timeout_seconds": 300,
+    # Identical-request response cache for LLM calls. Default OFF: the cache
+    # keys on the full message list, so retries and re-asks can serve stale
+    # answers. Re-enable for cost-sensitive high-QPS setups.
+    "llm_response_cache": False,
     # Extra directory roots that read_file / write_file may access, in
     # addition to the built-in project data/ and system temp dirs. Each
     # entry is an absolute path. Sensitive subpaths (.ssh, .gnupg, shell

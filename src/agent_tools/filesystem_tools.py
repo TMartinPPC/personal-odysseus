@@ -244,6 +244,17 @@ class ReadFileTool:
         from src.tool_execution import _resolve_tool_path, _resolve_search_root, _truncate
         raw_path, offset, limit = content.split("\n", 1)[0].strip(), 0, 0
         _stripped = content.strip()
+        # Legacy multi-line shape: path on line 1, offset on line 2, limit on
+        # line 3 (e.g. "path\n10\n5"). Parse it before the JSON shape below so
+        # both argument transports keep working.
+        _lines2 = content.split("\n")
+        if len(_lines2) >= 2 and not _stripped.startswith("{"):
+            try:
+                offset = int(_lines2[1].strip())
+                if len(_lines2) >= 3:
+                    limit = int(_lines2[2].strip())
+            except (TypeError, ValueError):
+                offset, limit = 0, 0
         if _stripped.startswith("{"):
             try:
                 _a = json.loads(_stripped)
@@ -258,24 +269,52 @@ class ReadFileTool:
             return {"error": f"read_file: {e}", "exit_code": 1}
         try:
             def _read():
-                if offset > 0 or limit > 0:
-                    start = max(offset, 1)
-                    out, n, budget = [], 0, MAX_READ_CHARS
-                    with open(path, "r", encoding="utf-8", errors="replace") as f:
-                        for i, line in enumerate(f, 1):
-                            if i < start:
-                                continue
-                            if limit > 0 and n >= limit:
-                                break
-                            out.append(line)
-                            n += 1
-                            budget -= len(line)
-                            if budget <= 0:
-                                out.append(f"\n... [truncated at {MAX_READ_CHARS} chars]")
-                                break
-                    return "".join(out)
+                """Read a line range, line-numbered, with a continuation contract.
+
+                Every read is returned as ``N: line`` (1-based) with a header
+                stating the shown range. When output was cut by limit or byte
+                budget, a trailing notice names the exact next offset so the
+                model can page through without re-reading or guessing. The
+                edit_file schema warns the model to strip the ``N: `` prefix
+                when reusing lines in edits.
+                """
+                def _page(fh, start, budget_chars, line_limit):
+                    lines = []
+                    shown_end = start - 1
+                    hit_line_limit = False
+                    for i, line in enumerate(fh, 1):
+                        if i < start:
+                            continue
+                        if line_limit and len(lines) >= line_limit:
+                            hit_line_limit = True
+                            break
+                        cost = len(line) + len(str(i)) + 2
+                        if cost > budget_chars:
+                            break
+                        budget_chars -= cost
+                        lines.append(f"{i}: {line}")
+                        shown_end = i
+                    return lines, shown_end, hit_line_limit
+
                 with open(path, "r", encoding="utf-8", errors="replace") as f:
-                    return f.read(MAX_READ_CHARS + 1)
+                    start = max(offset, 1) if (offset > 0 or limit > 0) else 1
+                    line_limit = limit if (offset > 0 or limit > 0) else 0
+                    lines, shown_end, hit_line_limit = _page(f, start, MAX_READ_CHARS, line_limit)
+                    if not (offset > 0 or limit > 0) and not hit_line_limit:
+                        # Whole-file request that fit: report the real end.
+                        pass
+                    header = f"[read_file {path} | lines {start}-{shown_end}]"
+                    footer = ""
+                    if hit_line_limit or lines:
+                        # Name the next offset whenever the caller can page
+                        # further; harmless when the file ended exactly here.
+                        footer = (
+                            f"\n[Showing lines {start}-{shown_end}. "
+                            f"Continue reading with offset: {shown_end + 1}"
+                            + (f", limit: {line_limit}" if line_limit else "")
+                            + ". When editing, strip the 'N: ' line-number prefix.]"
+                        )
+                    return header + "\n" + "".join(lines) + footer
             data = await asyncio.to_thread(_read)
         except FileNotFoundError:
             return {"error": f"read_file: {path}: not found", "exit_code": 1}
@@ -285,8 +324,6 @@ class ReadFileTool:
             return {"error": f"read_file: {path}: is a directory (use ls)", "exit_code": 1}
         except OSError as e:
             return {"error": f"read_file: {path}: {e}", "exit_code": 1}
-        if not (offset > 0 or limit > 0) and len(data) > MAX_READ_CHARS:
-            data = data[:MAX_READ_CHARS] + f"\n... [truncated at {MAX_READ_CHARS} chars]"
         return {"output": data, "exit_code": 0}
 
 class WriteFileTool:

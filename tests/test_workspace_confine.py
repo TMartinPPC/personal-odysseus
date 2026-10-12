@@ -106,7 +106,8 @@ async def test_read_write_edit_confined_e2e(ws, admin):
     _, r = await execute_tool_block(_block("write_file", "note.txt\nhello"), owner="a", workspace=ws)
     assert r["exit_code"] == 0 and os.path.isfile(os.path.join(ws, "note.txt"))
     _, r = await execute_tool_block(_block("read_file", "note.txt"), owner="a", workspace=ws)
-    assert r["exit_code"] == 0 and r["output"] == "hello"
+    # read_file is line-numbered now (harness-upgrades); content still intact.
+    assert r["exit_code"] == 0 and "1: hello" in r["output"]
 
     with open(os.path.join(ws, "f.txt"), "w") as f:
         f.write("foo bar")

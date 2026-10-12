@@ -517,8 +517,27 @@ def _get_http_client() -> httpx.AsyncClient:
         )
     return _http_client
 
+def _response_cache_enabled() -> bool:
+    """True when identical-request response caching is enabled.
+
+    Default OFF (harness-upgrades): the cache keys on the full message list,
+    so a retry of a failed turn — or a re-ask after new context arrived
+    upstream of the key — could serve a stale answer that makes the model
+    look broken ("I asked again and it said the same wrong thing"). Operators
+    can re-enable it for cost-sensitive high-QPS setups via
+    ``llm_response_cache`` in settings.
+    """
+    try:
+        from src.settings import get_setting
+        return bool(get_setting("llm_response_cache", False))
+    except Exception:
+        return False
+
+
 def _get_cached_response(cache_key: str) -> Optional[str]:
-    """Get cached response if it exists."""
+    """Get cached response if it exists and caching is enabled."""
+    if not _response_cache_enabled():
+        return None
     return _response_cache.get(cache_key)
 
 

@@ -327,7 +327,7 @@ class BashTool:
             if err:
                 output = (output + "\nSTDERR: " + err).strip() if output else "STDERR: " + err
             return {
-                "output": _truncate(output, MAX_OUTPUT_CHARS) or "(no output)",
+                "output": _truncate(output, MAX_OUTPUT_CHARS, tail=True) or "(no output)",
                 "exit_code": rc or 0,
                 "tmux_session": _tmux_session_name(str(session_id)),
             }
@@ -353,7 +353,7 @@ class BashTool:
         err = stderr.rstrip()
         if err:
             output = (output + "\nSTDERR: " + err).strip() if output else "STDERR: " + err
-        output = _truncate(output, MAX_OUTPUT_CHARS)
+        output = _truncate(output, MAX_OUTPUT_CHARS, tail=True)
         return {"output": output or "(no output)", "exit_code": rc or 0}
 
 class PythonTool:
@@ -379,5 +379,5 @@ class PythonTool:
         err = stderr.rstrip()
         if err:
             output = (output + "\nSTDERR: " + err).strip() if output else "STDERR: " + err
-        output = _truncate(output, MAX_OUTPUT_CHARS)
+        output = _truncate(output, MAX_OUTPUT_CHARS, tail=True)
         return {"output": output or "(no output)", "exit_code": rc or 0}

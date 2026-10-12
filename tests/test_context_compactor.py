@@ -33,7 +33,9 @@ class TestCompactThreshold:
         assert COMPACT_THRESHOLD == 0.85
 
     def test_summary_max_tokens(self):
-        assert SUMMARY_MAX_TOKENS == 1024
+        # Raised from 1024 (harness-upgrades): a 1024-token budget forced the
+        # summarizer to drop execution state, hurting post-compaction coherence.
+        assert SUMMARY_MAX_TOKENS == 4096
 
 
 class TestSelfSummaryPrompt:

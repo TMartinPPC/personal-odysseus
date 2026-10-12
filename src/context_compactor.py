@@ -38,7 +38,7 @@ def _content_as_text(content: Any) -> str:
 
 
 COMPACT_THRESHOLD = 0.85  # Trigger compaction at 85% of context window
-SUMMARY_MAX_TOKENS = 1024
+SUMMARY_MAX_TOKENS = 4096
 SMALL_CONTEXT_LIMIT = 8192  # Models with context <= this get aggressive trimming
 
 # Cursor-style self-summarization prompt — produces structured, dense summaries
@@ -278,13 +278,22 @@ def trim_for_context(messages: List[Dict], context_length: int, reserve_tokens: 
                 break
         return _sanitize_tool_messages(result + protected_msgs + convo_msgs)
 
-    # Still too big — truncate the first system message (but keep more than 500 chars)
+    # Still too big — truncate the first system message as a LAST resort, and
+    # keep far more than the old 2,000-char cut. The system prompt carries the
+    # tool guidance; silently amputating it mid-session is a prime cause of
+    # "the model forgot how to use tools". Raise the floor to 12,000 chars and
+    # log loudly when it fires.
     if essential_system:
         sys_text = essential_system[0].get("content", "")
-        if len(sys_text) > 2000:
+        if len(sys_text) > 12_000:
             truncated_system = dict(essential_system[0])
-            truncated_system["content"] = sys_text[:2000] + "\n[System prompt truncated for context limits]"
+            truncated_system["content"] = sys_text[:12_000] + "\n[System prompt truncated for context limits]"
             essential_system[0] = truncated_system
+            logger.warning(
+                "trim_for_context: system prompt truncated from %d to %d chars — "
+                "tool guidance may be degraded for this turn",
+                len(sys_text), 12_000,
+            )
             trimmed = essential_system + convo_msgs
             if estimate_tokens(trimmed) <= budget:
                 return _sanitize_tool_messages(essential_system + protected_msgs + convo_msgs)
@@ -358,8 +367,29 @@ async def maybe_compact(
     if len(convo_msgs) < 4:
         return messages, context_length, False
 
-    # Split conversation: summarize older half, keep recent half
-    split_point = len(convo_msgs) // 2
+    # Split conversation: summarize older messages, keep a generous recent
+    # tail verbatim. The previous midpoint split could summarize messages
+    # from minutes ago; keeping the latest half (bounded to ~25k chars of
+    # transcript) preserves in-flight work, pending questions, and tool
+    # state, which is what post-compaction coherence actually needs.
+    keep_chars = 25_000
+    kept_chars = 0
+    split_point = len(convo_msgs)
+    for i in range(len(convo_msgs) - 1, -1, -1):
+        kept_chars += len(_content_as_text(convo_msgs[i].get("content")))
+        if kept_chars > keep_chars:
+            split_point = i + 1
+            break
+    else:
+        # Whole conversation fits in the tail budget but the window is still
+        # over threshold (tiny context or huge system prompt): fall back to
+        # the midpoint split so compaction still fires.
+        split_point = len(convo_msgs) // 2
+    # Never summarize fewer than 4 messages (nothing to gain).
+    if len(convo_msgs) - split_point < 4:
+        split_point = min(split_point, len(convo_msgs) - 4)
+    if split_point <= 0:
+        return messages, context_length, False
     older = convo_msgs[:split_point]
     recent = convo_msgs[split_point:]
 
@@ -399,7 +429,7 @@ async def maybe_compact(
             temperature=0.2,
             max_tokens=SUMMARY_MAX_TOKENS,
             headers=compact_headers,
-            timeout=30,
+            timeout=90,
         )
     except Exception as e:
         logger.error(f"Compaction summary failed: {e}")

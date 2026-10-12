@@ -42,18 +42,32 @@ def get_upload_handler():
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def _truncate(text: str, limit: int = MAX_OUTPUT_CHARS) -> str:
-    """
-    Truncate text to *limit* characters with a suffix note.
+def _truncate(text: str, limit: int = MAX_OUTPUT_CHARS, *, tail: bool = False) -> str:
+    """Truncate text to *limit* characters with an actionable suffix note.
 
-    Callers treat the result as text, so always return a string: coerce a
-    non-string (None -> "", otherwise str(...)) instead of returning it raw,
-    which would just move the crash downstream.
+    The note tells the model how to get the rest of the output instead of a
+    dead end. With ``tail=True`` (shell output) the END of the text is kept —
+    errors and result summaries live at the bottom — with a head excerpt for
+    orientation. Callers treat the result as text, so always return a string:
+    coerce a non-string (None -> "", otherwise str(...)) instead of returning
+    it raw, which would just move the crash downstream.
     """
     if not isinstance(text, str):
         text = "" if text is None else str(text)
     if len(text) > limit:
-        return text[:limit] + f"\n... (truncated, {len(text)} chars total)"
+        if tail:
+            head = text[: limit // 5]
+            keep = limit - len(head)
+            return (
+                head
+                + f"\n... [{len(text) - limit} chars omitted from the middle] ...\n"
+                + text[-keep:]
+                + f"\n... (truncated, {len(text)} chars total; showing first {len(head)} and last {keep} — re-run with narrower output, e.g. pipe through 'tail -c {keep}' or write to a file and read a range)"
+            )
+        return (
+            text[:limit]
+            + f"\n... (truncated, {len(text)} chars total; continue with an offset/range request or narrow the query)"
+        )
     return text
 
 
