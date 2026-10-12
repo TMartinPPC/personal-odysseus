@@ -12,7 +12,7 @@ import json
 import re
 import time
 import logging
-from typing import Any, AsyncGenerator, List, Dict, Optional, Set
+from typing import Any, AsyncGenerator, Callable, List, Dict, Optional, Set
 from urllib.parse import urlparse
 
 from src.llm_core import (
@@ -2960,7 +2960,24 @@ def _resolve_tool_blocks(
                 converted_calls.append(tc)
                 logger.info(f"  -> converted: {tc_name} -> {block.tool_type}")
             else:
-                logger.warning(f"  -> FAILED to convert native call: {tc_name} args={tc_args[:200]}")
+                # The native call could not be converted (unparseable args,
+                # unknown name, missing required args). Dropping it silently
+                # leaves the model with no feedback — it sees its own call
+                # vanish and re-issues the same thing (oh-my-pi pattern:
+                # error results that teach). Surface it as a pseudo tool call
+                # that executes as an actionable error result; the assistant
+                # message keeps the original call so tool_call/tool_result
+                # pairing stays intact for providers that require it.
+                _tc_base = tc_name.split("__")[-1] if tc_name else ""
+                _known = _tc_base in TOOL_TAGS or tc_name in TOOL_TAGS
+                _malformed_info = {
+                    "tool": tc_name or "(missing name)",
+                    "reason": "unknown tool name" if not _known else "arguments were not valid JSON",
+                    "arguments": (tc_args or "")[:2000],
+                }
+                tool_blocks.append(ToolBlock("__malformed_tool_call__", json.dumps(_malformed_info)))
+                converted_calls.append(tc)
+                logger.warning(f"  -> FAILED to convert native call: {tc_name} args={tc_args[:200]} (surfaced as error result)")
         if tool_blocks:
             used_native = True
     if not used_native:
@@ -3449,6 +3466,7 @@ async def stream_agent_loop(
     _is_teacher_run: bool = False,
     history_session=None,
     defer_context_shaping: bool = False,
+    steering_getter: Optional[Callable[[], List[str]]] = None,
 ) -> AsyncGenerator[str, None]:
     """Streaming agent loop generator.
 
@@ -4436,6 +4454,13 @@ async def stream_agent_loop(
     # signatures + consecutive no-text tool rounds to bail early.
     _recent_call_sigs = collections.deque(maxlen=6)
     _stuck_rounds = 0
+    # Consecutive fully-empty rounds (no text, no reasoning, no tool calls).
+    # Some local models emit a blank round (e.g. all output went to a
+    # reasoning channel the parser dropped, or a decode glitch). One retry
+    # nudge usually recovers it; without a cap a pathological model burns
+    # every remaining round silently. Mirrors oh-my-pi's empty-stop cap.
+    _EMPTY_ROUND_MAX_RETRIES = 3
+    _empty_round_streak = 0
     # Frequency of each exact call signature (tool + args), for the runaway
     # backstop. Counting identical repeats — not distinct same-tool calls —
     # lets a legit batch (e.g. 18 calendar events at once) through.
@@ -4769,6 +4794,23 @@ async def stream_agent_loop(
         _approved_result_injected = True
 
     for round_num in range(1, max_rounds + 1):
+        # ── Steering drain (pi/opencode pattern) ─────────────────────
+        # Deliver mid-run user messages at the round boundary: after the
+        # previous round's tool results were appended, before the next LLM
+        # call. The model sees them as ordinary user turns, so course
+        # corrections arrive without cancelling the run or losing partial
+        # work. Round 1 drains nothing meaningful (the queue was cleared at
+        # loop start; entries land from round 2 onward).
+        if steering_getter is not None:
+            try:
+                _steers = steering_getter() or []
+            except Exception as _steer_err:  # never let steering break the run
+                logger.warning(f"[agent] steering drain failed: {_steer_err}")
+                _steers = []
+            for _steer in _steers:
+                messages.append({"role": "user", "content": _steer})
+                logger.info(f"[agent] steering message delivered at round {round_num}: {_steer[:80]!r}")
+
         round_response = ""
         round_reasoning = ""  # reasoning_content deltas (DeepSeek-thinking, vLLM --reasoning-parser)
         native_tool_calls = []  # populated if model uses function calling
@@ -5327,6 +5369,37 @@ async def stream_agent_loop(
                     })
                     yield f'data: {json.dumps({"type": "agent_step", "round": round_num + 1})}\n\n'
                     continue
+
+        # ── Empty-round recovery (oh-my-pi-style bounded retry) ──────
+        # A round that produced no text, no reasoning, and no tool calls is a
+        # decode failure, not an answer. Nudge the model with an exact
+        # directive instead of silently consuming the round; after the cap,
+        # let the run end naturally (the empty-response fallback handles it).
+        if (
+            not _force_answer
+            and not tool_blocks
+            and not native_tool_calls
+            and not _strip_think_blocks(round_response).strip()
+            and not round_reasoning.strip()
+        ):
+            _empty_round_streak += 1
+            if _empty_round_streak <= _EMPTY_ROUND_MAX_RETRIES:
+                logger.warning(
+                    f"[agent] round {round_num} was empty ({_empty_round_streak}/{_EMPTY_ROUND_MAX_RETRIES}); injecting retry directive"
+                )
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "Your previous response was completely empty — it contained no text and no tool "
+                        "calls. That is a malfunction, not an answer. Respond now: either answer the "
+                        "user's request concisely, or issue the next tool call you need. Do not repeat "
+                        "an empty response."
+                    ),
+                })
+                yield f'data: {json.dumps({"type": "agent_step", "round": round_num + 1})}\n\n'
+                continue
+        else:
+            _empty_round_streak = 0
 
         # Force-answer round: we told the model to STOP calling tools and
         # answer. If it ignored that and emitted a (possibly DSML) tool

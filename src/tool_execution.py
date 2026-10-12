@@ -1074,6 +1074,36 @@ async def _execute_tool_block_impl(
         except (ValueError, TypeError):
             pass
 
+    # Malformed native tool call: the loop could not convert the model's
+    # function call into an executable block (unparseable arguments, unknown
+    # name, missing required args). Never executes anything — it exists so
+    # the model gets actionable feedback instead of a silently dropped call.
+    if tool == "__malformed_tool_call__":
+        try:
+            info = json.loads(content or "{}")
+        except (json.JSONDecodeError, TypeError):
+            info = {}
+        _bad_name = str(info.get("tool") or "unknown")
+        _bad_reason = str(info.get("reason") or "the call could not be parsed")
+        _bad_args = str(info.get("arguments") or "")[:400]
+        _hint = ""
+        if _bad_reason == "unknown tool name":
+            _suggestions = _suggest_tool_names(_bad_name)
+            if _suggestions:
+                _hint = f" Did you mean: {', '.join(_suggestions)}?"
+        desc = f"{_bad_name}: malformed tool call (not executed)"
+        result = {
+            "error": (
+                f"Your tool call to '{_bad_name}' was NOT executed: {_bad_reason}."
+                + _hint
+                + (f" Raw arguments received: {_bad_args}. " if _bad_args else " ")
+                + "Re-issue the call with valid JSON arguments that match the tool's schema."
+            ),
+            "exit_code": 1,
+        }
+        logger.warning(f"Malformed native tool call surfaced to model: {_bad_name} ({_bad_reason})")
+        return desc, result
+
     # Reject tools that the user has disabled for this request
     if disabled_tools and not policy_names.isdisjoint(disabled_tools):
         desc = f"{tool}: BLOCKED"
